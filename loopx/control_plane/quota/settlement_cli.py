@@ -1,9 +1,9 @@
 """CLI rollout helpers for heartbeat settlement identity and receipt wiring."""
 
 from __future__ import annotations
-from .effective_action import EffectiveAction
 
 import argparse
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -12,14 +12,18 @@ from ..todos.contract import (
     normalize_todo_replan_obligation_id,
 )
 from ..work_items.autonomous_replan_obligation import (
+    AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION,
+    AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID,
+    AUTONOMOUS_REPLAN_DIGEST_COMPATIBILITY_STOP_CONDITION,
     replan_obligation_id_from_packet,
 )
 from .effect_program import SettlementIdentity
+from .effective_action import EffectiveAction
 from .error_codes import HeartbeatReceiptIdentityConflictError
 from .heartbeat_receipt import (
     heartbeat_receipt_view,
-    upgrade_identityless_heartbeat_receipt,
     requalify_bound_heartbeat_receipt,
+    upgrade_identityless_heartbeat_receipt,
 )
 from .settlement import (
     QuotaSettlementReadback,
@@ -222,8 +226,9 @@ def quota_rollout_settlement_binding(
     """Resolve one rollout binding without mixing authority levels.
 
     Explicit settlement arguments and the typed plan are causal identities.
-    The current selected Todo is a later projection, while a replan action
-    packet is only a diagnostic fallback when no concrete Todo is selected.
+    An admitted autonomous replan binds its obligation as the Turn's execution
+    identity; any selected Todo remains planning context for that decision.
+    Ordinary delivery may instead bind the current selected Todo.
     """
 
     if payload.get("effective_action") == EffectiveAction.UNSETTLED_HOST_TURN_RECOVERY.value:
@@ -244,6 +249,25 @@ def quota_rollout_settlement_binding(
         )
     if explicit_todo_id or explicit_replan_obligation_id:
         return explicit_todo_id, explicit_replan_obligation_id
+
+    if (
+        payload.get("effective_action")
+        == EffectiveAction.AUTONOMOUS_REPLAN_REQUIRED.value
+    ):
+        replan_packet = (
+            payload.get("replan_action_packet")
+            if isinstance(payload.get("replan_action_packet"), Mapping)
+            else {}
+        )
+        current_replan_obligation_id = normalize_todo_replan_obligation_id(
+            replan_packet.get("obligation_id")
+        )
+        if current_replan_obligation_id:
+            # The selected Todo remains planning context while the semantic
+            # replan is the Turn's execution obligation.  Bind that obligation
+            # before the portfolio's explicit-selection guard can make the
+            # committed Turn identity-less and impossible to settle.
+            return None, current_replan_obligation_id
 
     action_portfolio_value = payload.get("action_portfolio")
     action_portfolio: Mapping[str, object] = (
@@ -406,24 +430,51 @@ def quota_rollout_details(
     replan_packet = payload.get("replan_action_packet")
     obligation = payload.get("autonomous_replan_obligation")
     if semantic_replan_obligation_id and isinstance(obligation, Mapping) and obligation.get("obligation_id") == semantic_replan_obligation_id:
-        from ..work_items.replan_semantics_codec import project_replan_semantics
         from ...rollout_event_log import _safe_details
+        from ..work_items.replan_semantics_codec import project_replan_semantics
 
         source = project_replan_semantics({"operation": "receipt_review_source",
             "agent_id": getattr(args, "agent_id", None),
             "obligation": {key: value for key, value in obligation.items() if key != "replan_context"}})
         review = source["review_source"]
         if isinstance(review, Mapping):
-            # Retain the original stop clause only when the existing public
-            # metadata serializer preserves it exactly. Unsafe/lossy sources
-            # keep legacy strict recovery; never truncate a governing clause.
+            # Retain a short public stop clause verbatim.  A longer clause can
+            # still preserve its semantic identity through a digest, but only
+            # when the public metadata serializer accepts the entire source
+            # without private markers or whitespace normalization.  Unsafe or
+            # otherwise lossy sources keep legacy strict recovery.
             try:
                 safe = _safe_details({"semantic_replan_review_kind": review["kind"],
                     "semantic_replan_review_stop_condition": review["stop_condition"]})
             except ValueError:
                 safe = {}
-            if safe.get("semantic_replan_review_stop_condition") == review["stop_condition"]:
+            stop_condition = review.get("stop_condition")
+            if safe.get("semantic_replan_review_stop_condition") == stop_condition:
                 details.update(safe)
+            elif (
+                safe.get("semantic_replan_review_kind") == review.get("kind")
+                and isinstance(stop_condition, str)
+                and len(stop_condition) > 240
+                and " ".join(stop_condition.split()) == stop_condition
+            ):
+                stop_details = {
+                    "semantic_replan_review_kind": safe["semantic_replan_review_kind"],
+                    # Older readers require the scalar stop field.  Keep them
+                    # fail-closed on this path while a current reader verifies
+                    # the full clause through its digest (and known contract,
+                    # when available).
+                    "semantic_replan_review_stop_condition": (
+                        AUTONOMOUS_REPLAN_DIGEST_COMPATIBILITY_STOP_CONDITION
+                    ),
+                    "semantic_replan_review_stop_condition_sha256": hashlib.sha256(
+                        stop_condition.encode("utf-8")
+                    ).hexdigest(),
+                }
+                if stop_condition == AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION:
+                    stop_details["semantic_replan_review_stop_contract_id"] = (
+                        AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID
+                    )
+                details.update(stop_details)
     receipt = payload.get("heartbeat_receipt")
     capability_guard = (replan_packet.get("capability_guard") if isinstance(replan_packet, Mapping) else None) or (
         receipt.get("semantic_replan_capability_guard") if isinstance(receipt, Mapping) else None

@@ -35,6 +35,11 @@ import {
   preflightPriorHostTurnCloseout,
 } from "../../loopx/control_plane/quota/unsettled_host_turn_recovery.ts";
 import { requireJsonObject } from "../../loopx/control_plane/runtime_decode.ts";
+import {
+  AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION,
+  AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID,
+  AUTONOMOUS_REPLAN_DIGEST_COMPATIBILITY_STOP_CONDITION,
+} from "../../loopx/control_plane/work_items/replan_semantics.ts";
 
 const goalId = "settlement-goal";
 const agentId = "codex-settlement";
@@ -94,9 +99,36 @@ test("recorded review source retains its stop clause under the exact selected gu
     semantic_replan_review_stop_condition: "Stop at owner-only decisions."};
   assert.deepEqual(projectSemanticReplanGuard(details).selected_review_source, {
     kind: details.semantic_replan_review_kind, stop_condition: details.semantic_replan_review_stop_condition});
+  const digest = createHash("sha256").update(details.semantic_replan_review_stop_condition, "utf8").digest("hex");
+  assert.deepEqual(projectSemanticReplanGuard({semantic_replan_obligation_id: details.semantic_replan_obligation_id,
+    semantic_replan_review_kind: details.semantic_replan_review_kind,
+    semantic_replan_review_stop_condition_sha256: digest}).selected_review_source, {
+    kind: details.semantic_replan_review_kind, stop_condition_sha256: digest});
+  assert.deepEqual(projectSemanticReplanGuard({...details,
+    semantic_replan_review_stop_condition_sha256: digest}).selected_review_source, {
+    kind: details.semantic_replan_review_kind,
+    stop_condition: details.semantic_replan_review_stop_condition,
+    stop_condition_sha256: digest});
+  const defaultDigest = createHash("sha256").update(
+    AUTONOMOUS_REPLAN_DEFAULT_STOP_CONDITION, "utf8").digest("hex");
+  assert.deepEqual(projectSemanticReplanGuard({
+    semantic_replan_obligation_id: details.semantic_replan_obligation_id,
+    semantic_replan_review_kind: "periodic_review_due",
+    semantic_replan_review_stop_condition: AUTONOMOUS_REPLAN_DIGEST_COMPATIBILITY_STOP_CONDITION,
+    semantic_replan_review_stop_condition_sha256: defaultDigest,
+    semantic_replan_review_stop_contract_id: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID,
+  }).selected_review_source, {
+    kind: "periodic_review_due",
+    stop_condition: AUTONOMOUS_REPLAN_DIGEST_COMPATIBILITY_STOP_CONDITION,
+    stop_condition_sha256: defaultDigest,
+    stop_contract_id: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID,
+  });
   for (const patch of [{semantic_replan_obligation_id: ""},
     {semantic_replan_obligation_id: undefined}, {semantic_replan_review_kind: undefined},
     {semantic_replan_review_stop_condition: undefined}, {semantic_replan_review_stop_condition: "s".repeat(241)},
+    {semantic_replan_review_stop_condition_sha256: "bad"},
+    {semantic_replan_review_stop_condition_sha256: "0".repeat(64)},
+    {semantic_replan_review_stop_contract_id: AUTONOMOUS_REPLAN_DEFAULT_STOP_CONTRACT_ID},
     {semantic_replan_capability_id: "explore"}]) {
     assert.throws(() => projectSemanticReplanGuard({...details, ...patch}));
   }
